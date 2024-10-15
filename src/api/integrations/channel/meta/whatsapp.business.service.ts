@@ -371,6 +371,52 @@ export class BusinessStartupService extends ChannelStartupService {
               const mediaUrl = await s3Service.getObjectUrl(fullName);
 
               messageRaw.message.mediaUrl = mediaUrl;
+
+              const stanzaId = received?.messages[0]?.contextInfo?.stanzaId;
+              if (stanzaId) {
+                let contextUrlServer = `${urlServer}/${version}/${stanzaId}`;
+                const contextResult = await axios.get(contextUrlServer, { headers });
+                const contextBuffer = await axios.get(contextResult.data.url, { headers, responseType: 'arraybuffer' });
+          
+                const contextMediaType = message.messages[0].document
+                  ? 'document'
+                  : message.messages[0].image
+                  ? 'image'
+                  : message.messages[0].audio
+                  ? 'audio'
+                  : 'video';
+          
+                const contextMimeType = contextResult.headers['content-type'];
+                const contextContentDisposition = contextResult.headers['content-disposition'];
+                let contextFileName = `${stanzaId}.${contextMimeType.split('/')[1]}`;
+                if (contextContentDisposition) {
+                  const match = contextContentDisposition.match(/filename="(.+?)"/);
+                  if (match) {
+                    contextFileName = match[1];
+                  }
+                }
+          
+                const contextSize = contextResult.headers['content-length'] || contextBuffer.data.byteLength;
+                const contextFullName = join(`${this.instance.id}`, received.key.remoteJid, contextMediaType, contextFileName);
+          
+                await s3Service.uploadFile(contextFullName, contextBuffer.data, contextSize, {
+                  'Content-Type': contextMimeType,
+                });
+          
+                await this.prismaRepository.media.create({
+                  data: {
+                    messageId: stanzaId,
+                    instanceId: this.instanceId,
+                    type: contextMediaType,
+                    fileName: contextFullName,
+                    mimetype: contextMimeType,
+                  },
+                });
+          
+                const contextMediaUrl = await s3Service.getObjectUrl(contextFullName);
+          
+                messageRaw.contextInfo.mediaUrl = contextMediaUrl;
+              }
             } catch (error) {
               this.logger.error(['Error on upload file to minio', error?.message, error?.stack]);
             }
