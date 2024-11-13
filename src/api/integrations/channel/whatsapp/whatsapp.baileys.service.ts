@@ -31,11 +31,14 @@ import {
 import { InstanceDto, SetPresenceDto } from '@api/dto/instance.dto';
 import { HandleLabelDto, LabelDto } from '@api/dto/label.dto';
 import {
+  Button,
   ContactMessage,
   MediaMessage,
   Options,
   SendAudioDto,
+  SendButtonsDto,
   SendContactDto,
+  SendListDto,
   SendLocationDto,
   SendMediaDto,
   SendPollDto,
@@ -44,6 +47,7 @@ import {
   SendStickerDto,
   SendTextDto,
   StatusMessage,
+  TypeButton,
 } from '@api/dto/sendMessage.dto';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
@@ -117,10 +121,11 @@ import makeWASocket, {
 import { Label } from 'baileys/lib/Types/Label';
 import { LabelAssociation } from 'baileys/lib/Types/LabelAssociation';
 import { spawn } from 'child_process';
-import { isBase64, isURL } from 'class-validator';
+import { isArray, isBase64, isURL } from 'class-validator';
 import { randomBytes } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
 import ffmpeg from 'fluent-ffmpeg';
+import FormData from 'form-data';
 import { readFileSync } from 'fs';
 import Long from 'long';
 import mime from 'mime';
@@ -582,6 +587,23 @@ export class BaileysStartupService extends ChannelStartupService {
       cachedGroupMetadata: this.getGroupMetadataCache,
       userDevicesCache: this.userDevicesCache,
       transactionOpts: { maxCommitRetries: 10, delayBetweenTriesMs: 3000 },
+      patchMessageBeforeSending(message) {
+        if (
+          message.deviceSentMessage?.message?.listMessage?.listType === proto.Message.ListMessage.ListType.PRODUCT_LIST
+        ) {
+          message = JSON.parse(JSON.stringify(message));
+
+          message.deviceSentMessage.message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
+        }
+
+        if (message.listMessage?.listType == proto.Message.ListMessage.ListType.PRODUCT_LIST) {
+          message = JSON.parse(JSON.stringify(message));
+
+          message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
+        }
+
+        return message;
+      },
     };
 
     this.endSession = false;
@@ -1699,7 +1721,7 @@ export class BaileysStartupService extends ChannelStartupService {
           website: business?.website?.shift(),
         };
       } else {
-        const info: Instance = await waMonitor.instanceInfo(instanceName);
+        const info: Instance = await waMonitor.instanceInfo([instanceName]);
         const business = await this.fetchBusinessProfile(jid);
 
         return {
@@ -1767,6 +1789,28 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (messageId) option.messageId = messageId;
     else option.messageId = '3EB0' + randomBytes(18).toString('hex').toUpperCase();
+
+    if (message['viewOnceMessage']) {
+      const m = generateWAMessageFromContent(sender, message, {
+        timestamp: new Date(),
+        userJid: this.instance.wuid,
+        messageId,
+        quoted,
+      });
+      const id = await this.client.relayMessage(sender, message, { messageId });
+      m.key = {
+        id: id,
+        remoteJid: sender,
+        participant: isJidUser(sender) ? sender : undefined,
+        fromMe: true,
+      };
+      for (const [key, value] of Object.entries(m)) {
+        if (!value || (isArray(value) && value.length) === 0) {
+          delete m[key];
+        }
+      }
+      return m;
+    }
 
     if (
       !message['audio'] &&
@@ -1898,17 +1942,6 @@ export class BaileysStartupService extends ChannelStartupService {
     const isWA = (await this.whatsappNumber({ numbers: [number] }))?.shift();
 
     if (!isWA.exists && !isJidGroup(isWA.jid) && !isWA.jid.includes('@broadcast')) {
-      if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-        const body = {
-          key: { remoteJid: isWA.jid },
-        };
-
-        this.chatwootService.eventWhatsapp(
-          'contact.is_not_in_wpp',
-          { instanceName: this.instance.name, instanceId: this.instance.id },
-          body,
-        );
-      }
       throw new BadRequestException(isWA);
     }
 
@@ -2599,53 +2632,78 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async processAudio(audio: string): Promise<Buffer> {
-    let inputAudioStream: PassThrough;
+    if (process.env.API_AUDIO_CONVERTER) {
+      this.logger.verbose('Using audio converter API');
+      const formData = new FormData();
 
-    if (isURL(audio)) {
-      const timestamp = new Date().getTime();
-      const url = `${audio}?timestamp=${timestamp}`;
+      if (isURL(audio)) {
+        formData.append('url', audio);
+      } else {
+        formData.append('base64', audio);
+      }
 
-      const config: any = {
-        responseType: 'stream',
-      };
+      const { data } = await axios.post(process.env.API_AUDIO_CONVERTER, formData, {
+        headers: {
+          ...formData.getHeaders(),
+          apikey: process.env.API_AUDIO_CONVERTER_KEY,
+        },
+      });
 
-      const response = await axios.get(url, config);
-      inputAudioStream = response.data.pipe(new PassThrough());
+      if (!data.audio) {
+        throw new InternalServerErrorException('Failed to convert audio');
+      }
+
+      this.logger.verbose('Audio converted');
+      return Buffer.from(data.audio, 'base64');
     } else {
-      const audioBuffer = Buffer.from(audio, 'base64');
-      inputAudioStream = new PassThrough();
-      inputAudioStream.end(audioBuffer);
-    }
+      let inputAudioStream: PassThrough;
 
-    return new Promise((resolve, reject) => {
-      const outputAudioStream = new PassThrough();
-      const chunks: Buffer[] = [];
+      if (isURL(audio)) {
+        const timestamp = new Date().getTime();
+        const url = `${audio}?timestamp=${timestamp}`;
 
-      outputAudioStream.on('data', (chunk) => chunks.push(chunk));
-      outputAudioStream.on('end', () => {
-        const outputBuffer = Buffer.concat(chunks);
-        resolve(outputBuffer);
-      });
+        const config: any = {
+          responseType: 'stream',
+        };
 
-      outputAudioStream.on('error', (error) => {
-        console.log('error', error);
-        reject(error);
-      });
+        const response = await axios.get(url, config);
+        inputAudioStream = response.data.pipe(new PassThrough());
+      } else {
+        const audioBuffer = Buffer.from(audio, 'base64');
+        inputAudioStream = new PassThrough();
+        inputAudioStream.end(audioBuffer);
+      }
 
-      ffmpeg.setFfmpegPath(ffmpegPath.path);
+      return new Promise((resolve, reject) => {
+        const outputAudioStream = new PassThrough();
+        const chunks: Buffer[] = [];
 
-      ffmpeg(inputAudioStream)
-        .outputFormat('ogg')
-        .noVideo()
-        .audioCodec('libopus')
-        .addOutputOptions('-avoid_negative_ts make_zero')
-        .audioChannels(1)
-        .pipe(outputAudioStream, { end: true })
-        .on('error', function (error) {
+        outputAudioStream.on('data', (chunk) => chunks.push(chunk));
+        outputAudioStream.on('end', () => {
+          const outputBuffer = Buffer.concat(chunks);
+          resolve(outputBuffer);
+        });
+
+        outputAudioStream.on('error', (error) => {
           console.log('error', error);
           reject(error);
         });
-    });
+
+        ffmpeg.setFfmpegPath(ffmpegPath.path);
+
+        ffmpeg(inputAudioStream)
+          .outputFormat('ogg')
+          .noVideo()
+          .audioCodec('libopus')
+          .addOutputOptions('-avoid_negative_ts make_zero')
+          .audioChannels(1)
+          .pipe(outputAudioStream, { end: true })
+          .on('error', function (error) {
+            console.log('error', error);
+            reject(error);
+          });
+      });
+    }
   }
 
   public async audioWhatsapp(data: SendAudioDto, file?: any, isIntegration = false) {
@@ -2695,8 +2753,93 @@ export class BaileysStartupService extends ChannelStartupService {
     );
   }
 
-  public async buttonMessage() {
-    throw new BadRequestException('Method not available on WhatsApp Baileys');
+  private toJSONString(button: Button): string {
+    const toString = (obj: any) => JSON.stringify(obj);
+
+    const json = {
+      call: () => toString({ display_text: button.displayText, phone_number: button.phoneNumber }),
+      reply: () => toString({ display_text: button.displayText, id: button.id }),
+      copy: () => toString({ display_text: button.displayText, copy_code: button.copyCode }),
+      url: () =>
+        toString({
+          display_text: button.displayText,
+          url: button.url,
+          merchant_url: button.url,
+        }),
+    };
+
+    return json[button.type]?.() || '';
+  }
+
+  private readonly mapType = new Map<TypeButton, string>([
+    ['reply', 'quick_reply'],
+    ['copy', 'cta_copy'],
+    ['url', 'cta_url'],
+    ['call', 'cta_call'],
+  ]);
+
+  public async buttonMessage(data: SendButtonsDto) {
+    const generate = await (async () => {
+      if (data?.thumbnailUrl) {
+        return await this.prepareMediaMessage({
+          mediatype: 'image',
+          media: data.thumbnailUrl,
+        });
+      }
+    })();
+
+    const buttons = data.buttons.map((value) => {
+      return {
+        name: this.mapType.get(value.type),
+        buttonParamsJson: this.toJSONString(value),
+      };
+    });
+
+    const message: proto.IMessage = {
+      viewOnceMessage: {
+        message: {
+          interactiveMessage: {
+            body: {
+              text: (() => {
+                let t = '*' + data.title + '*';
+                if (data?.description) {
+                  t += '\n\n';
+                  t += data.description;
+                  t += '\n';
+                }
+                return t;
+              })(),
+            },
+            footer: {
+              text: data?.footer,
+            },
+            header: (() => {
+              if (generate?.message?.imageMessage) {
+                return {
+                  hasMediaAttachment: !!generate.message.imageMessage,
+                  imageMessage: generate.message.imageMessage,
+                };
+              }
+            })(),
+            nativeFlowMessage: {
+              buttons: buttons,
+              messageParamsJson: JSON.stringify({
+                from: 'api',
+                templateId: v4(),
+              }),
+            },
+          },
+        },
+      },
+    };
+
+    return await this.sendMessageWithTyping(data.number, message, {
+      delay: data?.delay,
+      presence: 'composing',
+      quoted: data?.quoted,
+      mentionsEveryOne: data?.mentionsEveryOne,
+      mentioned: data?.mentioned,
+    });
   }
 
   public async locationMessage(data: SendLocationDto) {
@@ -2720,8 +2863,27 @@ export class BaileysStartupService extends ChannelStartupService {
     );
   }
 
-  public async listMessage() {
-    throw new BadRequestException('Method not available on WhatsApp Baileys');
+  public async listMessage(data: SendListDto) {
+    return await this.sendMessageWithTyping(
+      data.number,
+      {
+        listMessage: {
+          title: data.title,
+          description: data.description,
+          buttonText: data?.buttonText,
+          footerText: data?.footerText,
+          sections: data.sections,
+          listType: 2,
+        },
+      },
+      {
+        delay: data?.delay,
+        presence: 'composing',
+        quoted: data?.quoted,
+        mentionsEveryOne: data?.mentionsEveryOne,
+        mentioned: data?.mentioned,
+      },
+    );
   }
 
   public async contactMessage(data: SendContactDto) {

@@ -61,7 +61,6 @@ export type Database = {
 export type DeleteData = {
   LOGICAL_MESSAGE_DELETE: boolean;
 };
-
 export type EventsRabbitmq = {
   APPLICATION_STARTUP: boolean;
   INSTANCE_CREATE: boolean;
