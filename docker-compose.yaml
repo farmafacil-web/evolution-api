@@ -2,6 +2,8 @@ services:
   evolution-api:
     hostname: prismasyncv2
     container_name: evolution_api
+    environment:
+      - NODE_OPTIONS=--max-old-space-size=2048
     build:
       context: .
       dockerfile: Dockerfile
