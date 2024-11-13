@@ -685,14 +685,28 @@ export class BaileysStartupService extends ChannelStartupService {
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
 
       for (const chat of chats) {
-        await this.prismaRepository.chat.updateMany({
+        const existingChat = await this.prismaRepository.chat.findFirst({
           where: {
             instanceId: this.instanceId,
             remoteJid: chat.id,
             name: chat.name,
           },
-          data: { remoteJid: chat.id },
         });
+
+        if (existingChat) {
+          await this.prismaRepository.chat.update({
+            where: { id: existingChat.id },
+            data: { remoteJid: chat.id },
+          });
+        } else {
+          await this.prismaRepository.chat.create({
+            data: {
+              instanceId: this.instanceId,
+              remoteJid: chat.id,
+              name: chat.name,
+            },
+          });
+        }
       }
     },
 
